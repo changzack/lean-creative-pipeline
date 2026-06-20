@@ -9,6 +9,19 @@ The default move of generating 8 raster assets and inlining them as base64 produ
 
 ## The most important lesson: visual references must be PIXELS, not text
 
+## Host the asset, don't inline it (lean-graph rule, 2026-06-19)
+
+The full-graph pattern was: generate image → base64-encode → glue into HTML as a `data:image/jpeg;base64,...` URI. That made HTML files 30-40MB, killed first paint, and prevented browser caching. The reason was historical — the full graph's QA walker opened builds via `file://` where remote `<img src="https://...">` tags fail CORS.
+
+The lean graph doesn't open builds from `file://`. We deploy to GitHub Pages. So the inline workaround is gone:
+
+1. Generate the asset via fal.ai.
+2. Push it to `changzack/prototypes/_assets/<run-name>/concept-N/` (in the same repo we deploy from).
+3. Builder writes `<img src="https://changzack.github.io/prototypes/_assets/<run>/concept-N/<slug>.jpg">` — a plain tag.
+4. HTML stays under 100KB. The asset caches forever in the browser.
+
+The `lean_asset_gen_node` in `pipeline.py` does this automatically when `--graph lean` is used and `FAL_KEY` is set. If GitHub Pages publishing isn't available (repo not cloned), it falls back to the fal.ai upstream URL (which expires in ~24h — fine for testing, not for archives).
+
 Text descriptions of design are inert to an LLM. Telling Claude "deep black canvas with violet accent and oversized pill button" doesn't transfer the taste of the page, because the model never saw it. It's like describing a song with adjectives.
 
 **If you want a visual reference to actually influence output, the model has to SEE the image.** This means:

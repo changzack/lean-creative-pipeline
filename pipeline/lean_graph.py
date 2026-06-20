@@ -122,8 +122,8 @@ def build_graph_lean():
 
     What was dropped from the full graph:
       - research (replaced by creative-approach-craft skill + refero refs)
-      - asset_gen (replaced by creative-asset-strategy skill; most builds
-        need 0-1 generated assets, not 8)
+      - asset_gen (replaced by `lean_asset_gen` — max 1 HOSTED hero image per
+        concept, served from a public CDN URL, no base64 inlining)
       - qa_loop + playability_loop (replaced by creative-taste-gate skill +
         the human gate)
       - judge_polish + pairwise_rank (replaced by human judgment at the gate)
@@ -135,6 +135,7 @@ def build_graph_lean():
     graph.add_node("scope_contract", scope_contract_node)
     graph.add_node("designer", designer_node)
     graph.add_node("approach_gate", approach_gate_node)
+    graph.add_node("lean_asset_gen", lean_asset_gen_node)
     graph.add_node("builder", builder_node)
     graph.add_node("human_gate", human_gate_node)
     graph.add_node("iterate", iterate_node)
@@ -144,8 +145,13 @@ def build_graph_lean():
     # Skip research: designers read brief + load creative-approach-craft skill
     graph.add_conditional_edges("scope_contract", fan_out_designers, ["designer"])
     graph.add_edge("designer", "approach_gate")
-    # Skip asset_gen: builder decides asset strategy via creative-asset-strategy
-    graph.add_conditional_edges("approach_gate", fan_out_builders, ["builder"])
+    # Lean asset gen: at most ONE hosted image per concept, gated by the
+    # designer's ASSET MANIFEST. If the manifest is empty, the node skips.
+    # The hero image is pushed to changzack/prototypes/_assets/<run>/concept-N/
+    # and served at https://changzack.github.io/prototypes/_assets/...
+    # The builder writes `<img src="https://...">` directly. NO base64 inlining.
+    graph.add_edge("approach_gate", "lean_asset_gen")
+    graph.add_conditional_edges("lean_asset_gen", fan_out_builders, ["builder"])
     # Skip qa_loop / judge_loop / pairwise_rank entirely
     graph.add_edge("builder", "human_gate")
     # human_gate uses Command() to route to deploy/iterate/END
@@ -153,6 +159,143 @@ def build_graph_lean():
     graph.add_edge("deploy", END)
 
     return graph
+
+
+# ─────────────────────────────────────────────────────────────
+# Lean asset generation — host on a public CDN, do NOT inline
+# ─────────────────────────────────────────────────────────────
+# The full-graph asset_gen_node commissions up to 8 assets per concept and
+# bakes them as base64 data URIs into the HTML. That produces 30-40MB single-
+# page builds. The reason was historical: the full graph's QA walker opened
+# builds via `file://` where remote `<img src="https://...">` tags fail CORS.
+#
+# The lean graph doesn't open builds from file:// — we deploy to GitHub Pages.
+# So we generate at most ONE hero image per concept, push it to a public repo,
+# and the builder writes a plain `<img src="https://...">` tag. HTML stays
+# under 100KB.
+
+# Replace these with your own public asset host. The default points at the
+# repo this pipeline ships into.
+PROTOTYPES_REPO_DIR = Path.home() / ".openclaw" / "workspace" / "prototypes-repo"
+PROTOTYPES_PAGES_BASE = "https://changzack.github.io/prototypes"
+
+
+def host_assets_on_github_pages(run_name: str, concept_id: int, local_files: list) -> list:
+    """Copy generated asset files into a public GitHub Pages repo, commit, and
+    push. Returns the list of public URLs (one per file, in order). Skips and
+    returns empty if the repo isn't cloned locally or the push fails — the
+    builder will fall back to CSS/SVG in that case.
+    """
+    import shutil
+    import subprocess as _sp
+
+    if not PROTOTYPES_REPO_DIR.exists() or not (PROTOTYPES_REPO_DIR / ".git").exists():
+        print(f"  [lean-asset-host] ⚠️  {PROTOTYPES_REPO_DIR} not a git checkout — skipping")
+        return []
+
+    rel_dir = Path("_assets") / run_name / f"concept-{concept_id}"
+    dest_dir = PROTOTYPES_REPO_DIR / rel_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    urls = []
+    for src in local_files:
+        src = Path(src)
+        if not src.exists():
+            continue
+        dst = dest_dir / src.name
+        shutil.copyfile(src, dst)
+        urls.append(f"{PROTOTYPES_PAGES_BASE}/{rel_dir.as_posix()}/{src.name}")
+
+    if not urls:
+        return []
+
+    try:
+        _sp.run(["git", "-C", str(PROTOTYPES_REPO_DIR), "pull", "--rebase", "--quiet"], check=False, timeout=30)
+        _sp.run(["git", "-C", str(PROTOTYPES_REPO_DIR), "add", str(rel_dir)], check=True, timeout=15)
+        _sp.run(
+            ["git", "-C", str(PROTOTYPES_REPO_DIR), "commit", "-m",
+             f"lean asset gen: {run_name} concept-{concept_id} ({len(urls)} file(s))"],
+            check=True, timeout=15,
+        )
+        _sp.run(["git", "-C", str(PROTOTYPES_REPO_DIR), "push", "--quiet"], check=True, timeout=60)
+        print(f"  [lean-asset-host] ✅ pushed {len(urls)} asset(s) for concept-{concept_id}")
+    except Exception as e:
+        print(f"  [lean-asset-host] ⚠️  push failed: {e}")
+        return []
+
+    return urls
+
+
+def lean_asset_gen_node(state):
+    """Lean asset gen: at most ONE generated image per concept, hosted at a
+    public URL. Skips concepts whose approach doc has no ASSET MANIFEST.
+
+    Assumes these helpers exist in your codebase (from the full graph):
+      - extract_asset_manifest(approach_content) → list of asset dicts
+      - generate_asset(asset, fal_key) → {url, model, ...}
+      - RUNS_DIR (Path)
+    """
+    import os, json, urllib.request
+
+    print(f"[LEAN ASSET GEN] Reviewing {len(state['approaches'])} approaches for hero assets")
+    fal_key = os.environ.get("FAL_KEY", "")
+    if not fal_key:
+        print("  [lean-asset-gen] ⚠️  FAL_KEY not set — skipping")
+        return {"asset_manifest": {}, "asset_base_url": PROTOTYPES_PAGES_BASE}
+
+    run_dir = RUNS_DIR / state["name"]
+    assets_dir = run_dir / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
+
+    all_assets = {}
+    for approach in state["approaches"]:
+        if approach.get("status") not in ("done", "approved", None):
+            continue
+        designer_id = approach["designer_id"]
+        manifest = extract_asset_manifest(approach["content"])
+        if not manifest:
+            print(f"  [lean-asset-gen] Designer {designer_id}: no ASSET MANIFEST — skipping")
+            all_assets[designer_id] = []
+            continue
+
+        hero = manifest[0]  # Lean rule: ONE hero asset per concept.
+        concept_dir = assets_dir / f"concept-{designer_id}"
+        concept_dir.mkdir(parents=True, exist_ok=True)
+
+        result = generate_asset(hero, fal_key)
+        if not result:
+            all_assets[designer_id] = []
+            continue
+
+        local_path = concept_dir / f"{hero['name']}.jpg"
+        try:
+            urllib.request.urlretrieve(result["url"], str(local_path))
+            result["local_path"] = str(local_path)
+            result["size_kb"] = local_path.stat().st_size // 1024
+        except Exception as e:
+            print(f"  [lean-asset-gen] download failed: {e}")
+            all_assets[designer_id] = []
+            continue
+
+        hosted = host_assets_on_github_pages(state["name"], designer_id, [local_path])
+        result["hosted_url"] = hosted[0] if hosted else result.get("url", "")
+
+        # Write an ASSETS.md the builder reads — tells it to use the HOSTED URL
+        # with a plain <img src>, NOT to base64-encode.
+        ref_path = concept_dir / "ASSETS.md"
+        ref_path.write_text(
+            f"# Hero Asset (lean — HOSTED, do NOT inline)\n\n"
+            f"## {hero['name']}\n"
+            f"- Public URL: `{result['hosted_url']}`\n"
+            f"- Description: {hero.get('description','')[:200]}\n\n"
+            f"```html\n<img src=\"{result['hosted_url']}\" alt=\"...\" />\n```\n\n"
+            f"Do NOT base64-encode this image. Do NOT inline it. HTML stays under 100KB.\n"
+        )
+        with open(concept_dir / "manifest.json", "w") as f:
+            json.dump([result], f, indent=2)
+        all_assets[designer_id] = [result]
+
+    return {"asset_manifest": all_assets, "asset_base_url": PROTOTYPES_PAGES_BASE}
 
 
 # ─────────────────────────────────────────────────────────────
