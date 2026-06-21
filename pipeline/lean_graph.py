@@ -122,8 +122,8 @@ def build_graph_lean():
 
     What was dropped from the full graph:
       - research (replaced by creative-approach-craft skill + refero refs)
-      - asset_gen (replaced by `lean_asset_gen` — max 1 HOSTED hero image per
-        concept, served from a public CDN URL, no base64 inlining)
+      - asset_gen (replaced by `lean_asset_gen` — up to 5 HOSTED assets per
+        concept, mixed images + 1 video loop max, public CDN URLs, no inlining)
       - qa_loop + playability_loop (replaced by creative-taste-gate skill +
         the human gate)
       - judge_polish + pairwise_rank (replaced by human judgment at the gate)
@@ -170,14 +170,19 @@ def build_graph_lean():
 # builds via `file://` where remote `<img src="https://...">` tags fail CORS.
 #
 # The lean graph doesn't open builds from file:// — we deploy to GitHub Pages.
-# So we generate at most ONE hero image per concept, push it to a public repo,
-# and the builder writes a plain `<img src="https://...">` tag. HTML stays
-# under 100KB.
+# So we generate UP TO 5 assets per concept (mixed images + 1 video loop max),
+# push each to a public repo, and the builder writes plain `<img>` / `<video>`
+# tags. HTML stays under 100KB. Per-concept caps: 5 assets, $2.00 budget.
 
 # Replace these with your own public asset host. The default points at the
 # repo this pipeline ships into.
 PROTOTYPES_REPO_DIR = Path.home() / ".openclaw" / "workspace" / "prototypes-repo"
 PROTOTYPES_PAGES_BASE = "https://changzack.github.io/prototypes"
+
+# Per-concept caps for the lean asset gen node.
+LEAN_ASSET_MAX_COUNT = 5
+LEAN_ASSET_MAX_COST = 2.00
+LEAN_ASSET_WARN_COST = 1.00
 
 
 def host_assets_on_github_pages(run_name: str, concept_id: int, local_files: list) -> list:
@@ -227,17 +232,20 @@ def host_assets_on_github_pages(run_name: str, concept_id: int, local_files: lis
 
 
 def lean_asset_gen_node(state):
-    """Lean asset gen: at most ONE generated image per concept, hosted at a
-    public URL. Skips concepts whose approach doc has no ASSET MANIFEST.
+    """Lean asset gen: up to LEAN_ASSET_MAX_COUNT assets per concept (mixed
+    images + at most 1 video loop), hosted at public URLs. Skips concepts
+    whose approach doc has no ASSET MANIFEST. Stops a concept early when
+    cumulative cost hits LEAN_ASSET_MAX_COST.
 
     Assumes these helpers exist in your codebase (from the full graph):
       - extract_asset_manifest(approach_content) → list of asset dicts
-      - generate_asset(asset, fal_key) → {url, model, ...}
+      - generate_asset(asset, fal_key) → {url, kind, ext, cost, model, ...}
+      - route_asset_model(asset) → fal model id
       - RUNS_DIR (Path)
     """
     import os, json, urllib.request
 
-    print(f"[LEAN ASSET GEN] Reviewing {len(state['approaches'])} approaches for hero assets")
+    print(f"[LEAN ASSET GEN] Reviewing {len(state['approaches'])} approaches")
     fal_key = os.environ.get("FAL_KEY", "")
     if not fal_key:
         print("  [lean-asset-gen] ⚠️  FAL_KEY not set — skipping")
@@ -258,45 +266,71 @@ def lean_asset_gen_node(state):
             all_assets[designer_id] = []
             continue
 
-        hero = manifest[0]  # Lean rule: ONE hero asset per concept.
+        manifest = manifest[:LEAN_ASSET_MAX_COUNT]
         concept_dir = assets_dir / f"concept-{designer_id}"
         concept_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  [lean-asset-gen] Designer {designer_id}: {len(manifest)} asset(s) to generate")
 
-        result = generate_asset(hero, fal_key)
-        if not result:
+        generated = []
+        concept_cost = 0.0
+        for idx, asset in enumerate(manifest, start=1):
+            if concept_cost >= LEAN_ASSET_MAX_COST:
+                print(f"    [lean-asset-gen] ⚠️  hit ${LEAN_ASSET_MAX_COST:.2f} cap; dropping remaining")
+                break
+            result = generate_asset(asset, fal_key)
+            if not result:
+                continue
+            ext = result.get("ext") or ("mp4" if result.get("kind") == "video" else "jpg")
+            local_path = concept_dir / f"{asset['name']}.{ext}"
+            try:
+                urllib.request.urlretrieve(result["url"], str(local_path))
+                result["local_path"] = str(local_path)
+                result["size_kb"] = local_path.stat().st_size // 1024
+            except Exception as e:
+                print(f"    [lean-asset-gen] download failed: {e}")
+                continue
+            concept_cost += result.get("cost", 0.0)
+            hosted = host_assets_on_github_pages(state["name"], designer_id, [local_path])
+            result["hosted_url"] = hosted[0] if hosted else result.get("url", "")
+            generated.append(result)
+
+        if not generated:
             all_assets[designer_id] = []
             continue
 
-        local_path = concept_dir / f"{hero['name']}.jpg"
-        try:
-            urllib.request.urlretrieve(result["url"], str(local_path))
-            result["local_path"] = str(local_path)
-            result["size_kb"] = local_path.stat().st_size // 1024
-        except Exception as e:
-            print(f"  [lean-asset-gen] download failed: {e}")
-            all_assets[designer_id] = []
-            continue
+        # ASSETS.md: list every asset with type-specific embed snippets
+        # (img for images, autoplay-muted-loop video tag for video-loops).
+        lines = [
+            f"# Hero Assets — concept-{designer_id} (HOSTED, do NOT inline)",
+            "",
+            f"{len(generated)} asset(s) generated and uploaded to a public CDN.",
+            "Use `<img src=\"...\">` for images, `<video src=\"...\" autoplay muted loop playsinline>` for video-loops.",
+            "",
+        ]
+        for a in generated:
+            url = a["hosted_url"]
+            kind = a.get("kind", "image")
+            name = a["name"]
+            desc = a.get("prompt", "")[:160]
+            lines.append(f"## {name}  *(type: {a.get('type','image')} · {a.get('size_kb','?')}KB)*")
+            lines.append(f"- Public URL: `{url}`")
+            lines.append(f"- Description: {desc}")
+            if kind == "video":
+                lines.append("```html")
+                lines.append(f'<video src="{url}" autoplay muted loop playsinline></video>')
+                lines.append("```")
+            else:
+                lines.append("```html")
+                lines.append(f'<img src="{url}" alt="{desc[:80]}" loading="eager" />')
+                lines.append("```")
+            lines.append("")
 
-        hosted = host_assets_on_github_pages(state["name"], designer_id, [local_path])
-        result["hosted_url"] = hosted[0] if hosted else result.get("url", "")
-
-        # Write an ASSETS.md the builder reads — tells it to use the HOSTED URL
-        # with a plain <img src>, NOT to base64-encode.
-        ref_path = concept_dir / "ASSETS.md"
-        ref_path.write_text(
-            f"# Hero Asset (lean — HOSTED, do NOT inline)\n\n"
-            f"## {hero['name']}\n"
-            f"- Public URL: `{result['hosted_url']}`\n"
-            f"- Description: {hero.get('description','')[:200]}\n\n"
-            f"```html\n<img src=\"{result['hosted_url']}\" alt=\"...\" />\n```\n\n"
-            f"Do NOT base64-encode this image. Do NOT inline it. HTML stays under 100KB.\n"
-        )
+        (concept_dir / "ASSETS.md").write_text("\n".join(lines))
         with open(concept_dir / "manifest.json", "w") as f:
-            json.dump([result], f, indent=2)
-        all_assets[designer_id] = [result]
+            json.dump(generated, f, indent=2)
+        all_assets[designer_id] = generated
 
     return {"asset_manifest": all_assets, "asset_base_url": PROTOTYPES_PAGES_BASE}
-
 
 # ─────────────────────────────────────────────────────────────
 # Designer-node injection (inside the existing designer_node body)

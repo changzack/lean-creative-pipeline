@@ -9,18 +9,65 @@ The default move of generating 8 raster assets and inlining them as base64 produ
 
 ## The most important lesson: visual references must be PIXELS, not text
 
-## Host the asset, don't inline it (lean-graph rule, 2026-06-19)
+## Host the asset, don't inline it (lean-graph rule, 2026-06-19, multi-asset update 2026-06-19)
 
 The full-graph pattern was: generate image → base64-encode → glue into HTML as a `data:image/jpeg;base64,...` URI. That made HTML files 30-40MB, killed first paint, and prevented browser caching. The reason was historical — the full graph's QA walker opened builds via `file://` where remote `<img src="https://...">` tags fail CORS.
 
 The lean graph doesn't open builds from `file://`. We deploy to GitHub Pages. So the inline workaround is gone:
 
-1. Generate the asset via fal.ai.
-2. Push it to `changzack/prototypes/_assets/<run-name>/concept-N/` (in the same repo we deploy from).
-3. Builder writes `<img src="https://changzack.github.io/prototypes/_assets/<run>/concept-N/<slug>.jpg">` — a plain tag.
-4. HTML stays under 100KB. The asset caches forever in the browser.
+1. Generate up to 5 assets via fal.ai (mix of images + 1 video loop max).
+2. Push each one to `changzack/prototypes/_assets/<run-name>/concept-N/` (same repo as deploys).
+3. Builder writes `<img src="https://changzack.github.io/prototypes/_assets/<run>/concept-N/<slug>.jpg">` or `<video src=".../<slug>.mp4" autoplay muted loop playsinline>` directly.
+4. HTML stays under 100KB. Assets cache forever in the browser.
 
-The `lean_asset_gen_node` in `pipeline.py` does this automatically when `--graph lean` is used and `FAL_KEY` is set. If GitHub Pages publishing isn't available (repo not cloned), it falls back to the fal.ai upstream URL (which expires in ~24h — fine for testing, not for archives).
+The `lean_asset_gen_node` in `pipeline.py` does this automatically when `--graph lean` is used and `FAL_KEY` is set. Per-concept caps: 5 assets max, $2.00 budget hard cap, soft warn at $1.00.
+
+## Multi-asset playbook for landing pages (lean graph)
+
+A strong landing page typically uses 3-5 assets across 2-3 categories, not 1 hero and not 8 raster blobs. Pick the combo that matches the concept:
+
+**Editorial / magazine direction**
+- 1 hero photo (large, photoreal, restrained framing)
+- 1 paper-or-grain texture as section overlay (mix-blend-mode: multiply)
+- 1-2 graphic marks (issue number, stamp, hairline divider, foil seal)
+- Optional: 1 illustration if the concept is editorial-illustrated
+
+**Luxury / atmospheric direction**
+- 1 render-3d of the central object (membership card, product, package)
+- 1 video-loop for hero atmosphere (slow camera, moody lighting, NO speech / NO text)
+- 1 gold/foil graphic seal
+- 1 atmospheric texture overlay (light leak, bokeh, smoke)
+
+**Street / hype / drop direction**
+- 2-3 product/photo shots (hero + 2 secondary, different angles)
+- 1 distress texture / grain / sticker-collage atmosphere
+- 1 graphic mark (numbered badge, "DROP" stamp, ticker glyph)
+- Optional: 1 video-loop for ticker / marquee background
+
+**Pure-CSS direction (legitimately empty manifest)**
+- Typography-led concepts where the wow moment is type contrast, kinetic letterforms, or pure geometric composition.
+- Generative concepts where canvas/WebGL is the art.
+- Leave the ASSET MANIFEST empty. The lean graph respects this and skips the node. The builder gets nothing to embed and uses CSS/SVG/canvas for everything.
+
+## Asset type → fal model routing (lean)
+
+| Type | fal model | Cost | Use for |
+|---|---|---|---|
+| `texture` | flux/schnell | $0.003 | grain, paper, foil, distress overlays |
+| `atmosphere` | flux-2-pro | $0.03 | light leaks, bokeh, smoke, moody backgrounds |
+| `product` / `photo` | flux-2-pro | $0.03 | hero shots, secondary product photos |
+| `render-3d` | flux-2-pro + 3D prompt suffix | $0.03 | photoreal 3D-look renders of cards/objects |
+| `graphic` | recraft-v3 | $0.06 | badges, stamps, numbered marks, text-bearing graphics |
+| `illustration` | nano-banana-2 | $0.08 | painted/illustrated editorial art |
+| `video-loop` | kling-video v1.6 standard | $0.35 | 5s ambient mp4 loop, autoplay/muted/loop |
+
+`render-3d` is the same model as `product` — the difference is the prompt suffix the pipeline appends: "photoreal 3D render, octane render, cinematic studio lighting, soft shadows, depth of field, premium product visualization." That suffix reliably shifts flux-2-pro toward a 3D-look output without a separate model.
+
+Video-loops have a HARD per-concept cap of 1 (designer enforced) because they burn the budget — at $0.35 each, two videos already eats 35% of the $2.00 cap.
+
+**Gotcha when wiring this in: the file:// QA walker also pushed a "no external image URLs" CORS ban into the builder's HARD ASSET CONSTRAINT block.** That ban is obsolete too — strip it (or branch on `graph_mode == "lean"`) or the builder will refuse to use the hosted URL you just generated. See `references/orphaned-workarounds-checklist.md` for the general pattern of auditing what gets orphaned when you delete a pipeline node.
+
+**Verified end-to-end 2026-06-19** on the Complex Allegiance brief, lean graph + hosted assets: 3 concepts, builds 28KB / 46KB / 33KB (vs. full graph's 4MB / 36MB / 42MB on a similar brief), total run cost $1.17 including $0.06 in fal.ai calls. One designer (street/hype direction) correctly opted out of any commissioned asset and drew everything in CSS/SVG — the gating-on-empty-ASSET-MANIFEST rule worked. The two designers who commissioned a hero card got it hosted at a stable URL and embedded with a plain `<img src>` tag. See `references/lean-asset-hosting-on-github-pages.md` for the concrete integration recipe, helper functions to reuse, and the verification ritual (curl-for-200 after push).
 
 Text descriptions of design are inert to an LLM. Telling Claude "deep black canvas with violet accent and oversized pill button" doesn't transfer the taste of the page, because the model never saw it. It's like describing a song with adjectives.
 
